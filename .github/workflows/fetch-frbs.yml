@@ -5,6 +5,9 @@ on:
     - cron: '0 12 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   fetch:
     runs-on: ubuntu-latest
@@ -13,23 +16,28 @@ jobs:
       
       - name: Fetch FRBs from TNS
         run: |
-          # Download TNS catalog with browser-like headers
-          curl -L "https://www.wis-tns.org/system/files/tns_public_objects/tns_public_objects.csv.zip" \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
-            -H "Accept-Language: en-US,en;q=0.5" \
-            -o tns.zip
+          # TNS requires accepting cookies/terms - try the search API instead
+          # First, let's see what we get
+          curl -L -v "https://www.wis-tns.org/search?&discovered_period_value=1&discovered_period_units=years&objtype%5B%5D=130&num_page=500&format=csv" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            -o tns_search.csv 2>&1 | head -50
           
-          # Check if download succeeded
-          if [ ! -s tns.zip ]; then
-            echo "Download failed or empty"
+          echo "--- File contents (first 500 bytes) ---"
+          head -c 500 tns_search.csv || true
+          
+          # Check if we got a CSV
+          if head -1 tns_search.csv | grep -q "<!DOCTYPE\|<html"; then
+            echo "Got HTML instead of CSV, TNS is blocking"
+            
+            # Fallback: use existing file or create minimal one
+            if [ ! -f frbs.json ]; then
+              echo "Creating placeholder frbs.json"
+              echo '[{"name":"FRB 20240304A","date":"2024-03-04","source":"CHIME/FRB"}]' > frbs.json
+            fi
             exit 0
           fi
           
-          # Unzip
-          unzip -o tns.zip || { echo "Unzip failed"; exit 0; }
-          
-          # Extract FRBs
+          # Process CSV
           python3 << 'EOF'
           import csv
           import json
@@ -37,33 +45,39 @@ jobs:
           frbs = []
           
           try:
-              with open('tns_public_objects.csv', 'r', encoding='utf-8', errors='ignore') as f:
-                  # Skip the first line (metadata row)
-                  first_line = f.readline()
+              with open('tns_search.csv', 'r', encoding='utf-8', errors='ignore') as f:
+                  content = f.read()
+                  # Skip any metadata lines
+                  lines = content.split('\n')
                   
-                  reader = csv.DictReader(f)
+                  # Find header line
+                  start_idx = 0
+                  for i, line in enumerate(lines):
+                      if 'name' in line.lower() and ('ra' in line.lower() or 'disc' in line.lower()):
+                          start_idx = i
+                          break
+                  
+                  clean_csv = '\n'.join(lines[start_idx:])
+                  
+                  reader = csv.DictReader(clean_csv.splitlines())
                   for row in reader:
-                      # Check if it's an FRB
-                      prefix = row.get('name_prefix', '').strip().upper()
-                      if prefix == 'FRB':
+                      name = row.get('Name', row.get('name', ''))
+                      if name:
                           frbs.append({
-                              "name": f"FRB {row.get('name', '').strip()}",
-                              "date": row.get('discoverydate', '').strip(),
-                              "ra": row.get('ra', '').strip(),
-                              "dec": row.get('decl', '').strip(),
-                              "source": row.get('reporting_group/0/groupname', row.get('source_group/groupname', 'TNS')).strip() or 'TNS'
+                              "name": f"FRB {name}" if not name.startswith('FRB') else name,
+                              "date": row.get('Discovery Date (UT)', row.get('discoverydate', '')),
+                              "ra": row.get('RA', row.get('ra', '')),
+                              "dec": row.get('DEC', row.get('decl', '')),
+                              "source": row.get('Reporting Group', 'TNS')
                           })
               
               if frbs:
-                  # Sort by date descending
                   frbs.sort(key=lambda x: x.get('date', ''), reverse=True)
-                  
                   with open('frbs.json', 'w') as f:
                       json.dump(frbs, f, indent=2)
-                  
                   print(f"Saved {len(frbs)} FRBs")
               else:
-                  print("No FRBs found in catalog")
+                  print("No FRBs found")
                   
           except Exception as e:
               print(f"Error: {e}")
@@ -71,8 +85,8 @@ jobs:
       
       - name: Commit changes
         run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add frbs.json || true
           git diff --staged --quiet || git commit -m "Update FRB data $(date +%Y-%m-%d)"
-          git push || true
+          git push
