@@ -1,0 +1,64 @@
+name: Fetch FRBs
+
+on:
+  schedule:
+    - cron: '0 12 * * *'  # Daily at noon UTC
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Fetch FRBs from TNS
+        run: |
+          curl -s "https://www.wis-tns.org/system/files/tns_public_objects/tns_public_objects.csv.zip" \
+            -H "User-Agent: Mozilla/5.0" \
+            -o tns.zip || exit 0
+          
+          unzip -o tns.zip || exit 0
+          
+          # Extract FRBs only, convert to JSON
+          python3 << 'EOF'
+          import csv
+          import json
+          from datetime import datetime, timedelta
+          
+          frbs = []
+          cutoff = datetime.now() - timedelta(days=90)
+          
+          for f in ["tns_public_objects.csv"]:
+              try:
+                  with open(f, 'r', encoding='utf-8', errors='ignore') as csvfile:
+                      # Skip first line (metadata)
+                      next(csvfile, None)
+                      reader = csv.DictReader(csvfile)
+                      for row in reader:
+                          if row.get('name_prefix', '').upper() == 'FRB':
+                              frbs.append({
+                                  'name': f"FRB {row.get('name', '')}",
+                                  'date': row.get('discoverydate', ''),
+                                  'ra': row.get('ra', ''),
+                                  'dec': row.get('decl', ''),
+                                  'source': row.get('reporting_groupname', row.get('source_group', 'TNS'))
+                              })
+              except Exception as e:
+                  print(f"Error: {e}")
+          
+          # Sort by date descending
+          frbs.sort(key=lambda x: x['date'], reverse=True)
+          
+          with open('frbs.json', 'w') as f:
+              json.dump(frbs[:100], f, indent=2)  # Keep latest 100
+          
+          print(f"Saved {len(frbs[:100])} FRBs")
+          EOF
+      
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add frbs.json || true
+          git diff --staged --quiet || git commit -m "Update FRB data"
+          git push || true
