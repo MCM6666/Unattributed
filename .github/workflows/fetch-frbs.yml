@@ -15,72 +15,104 @@ jobs:
       - uses: actions/checkout@v4
       
       - name: Fetch FRBs from TNS
+        env:
+          TNS_BOT_ID: ${{ secrets.TNS_BOT_ID }}
+          TNS_BOT_NAME: ${{ secrets.TNS_BOT_NAME }}
+          TNS_API_KEY: ${{ secrets.TNS_API_KEY }}
         run: |
-          # TNS requires accepting cookies/terms - try the search API instead
-          # First, let's see what we get
-          curl -L -v "https://www.wis-tns.org/search?&discovered_period_value=1&discovered_period_units=years&objtype%5B%5D=130&num_page=500&format=csv" \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            -o tns_search.csv 2>&1 | head -50
+          # Use daily delta file (yesterday's date)
+          DATE=$(date -d "yesterday" +%Y%m%d)
           
-          echo "--- File contents (first 500 bytes) ---"
-          head -c 500 tns_search.csv || true
+          curl -X POST \
+            -H "user-agent: tns_marker{\"tns_id\":${TNS_BOT_ID},\"type\":\"bot\",\"name\":\"${TNS_BOT_NAME}\"}" \
+            "https://www.wis-tns.org/system/files/tns_public_objects/tns_public_objects_${DATE}.csv.zip" \
+            -o tns.zip
           
-          # Check if we got a CSV
-          if head -1 tns_search.csv | grep -q "<!DOCTYPE\|<html"; then
-            echo "Got HTML instead of CSV, TNS is blocking"
-            
-            # Fallback: use existing file or create minimal one
-            if [ ! -f frbs.json ]; then
-              echo "Creating placeholder frbs.json"
-              echo '[{"name":"FRB 20240304A","date":"2024-03-04","source":"CHIME/FRB"}]' > frbs.json
-            fi
+          # Check download
+          if [ ! -s tns.zip ] || file tns.zip | grep -q "HTML"; then
+            echo "Download failed, trying full catalog"
+            curl -X POST \
+              -H "user-agent: tns_marker{\"tns_id\":${TNS_BOT_ID},\"type\":\"bot\",\"name\":\"${TNS_BOT_NAME}\"}" \
+              "https://www.wis-tns.org/system/files/tns_public_objects/tns_public_objects.csv.zip" \
+              -o tns.zip
+          fi
+          
+          unzip -o tns.zip || { echo "Unzip failed"; exit 0; }
+          
+          # Find the CSV file
+          CSV_FILE=$(ls *.csv 2>/dev/null | head -1)
+          if [ -z "$CSV_FILE" ]; then
+            echo "No CSV found"
             exit 0
           fi
           
-          # Process CSV
+          echo "Processing: $CSV_FILE"
+          
           python3 << 'EOF'
           import csv
           import json
+          import glob
           
           frbs = []
+          existing = []
           
+          # Load existing FRBs
           try:
-              with open('tns_search.csv', 'r', encoding='utf-8', errors='ignore') as f:
-                  content = f.read()
-                  # Skip any metadata lines
-                  lines = content.split('\n')
-                  
-                  # Find header line
-                  start_idx = 0
-                  for i, line in enumerate(lines):
-                      if 'name' in line.lower() and ('ra' in line.lower() or 'disc' in line.lower()):
-                          start_idx = i
-                          break
-                  
-                  clean_csv = '\n'.join(lines[start_idx:])
-                  
-                  reader = csv.DictReader(clean_csv.splitlines())
-                  for row in reader:
-                      name = row.get('Name', row.get('name', ''))
-                      if name:
-                          frbs.append({
-                              "name": f"FRB {name}" if not name.startswith('FRB') else name,
-                              "date": row.get('Discovery Date (UT)', row.get('discoverydate', '')),
-                              "ra": row.get('RA', row.get('ra', '')),
-                              "dec": row.get('DEC', row.get('decl', '')),
-                              "source": row.get('Reporting Group', 'TNS')
-                          })
-              
-              if frbs:
-                  frbs.sort(key=lambda x: x.get('date', ''), reverse=True)
-                  with open('frbs.json', 'w') as f:
-                      json.dump(frbs, f, indent=2)
-                  print(f"Saved {len(frbs)} FRBs")
-              else:
-                  print("No FRBs found")
-                  
-          except Exception as e:
-              print(f"Error: {e}")
+              with open('frbs.json', 'r') as f:
+                  existing = json.load(f)
+          except:
+              pass
+          
+          # Process new CSV
+          csv_files = glob.glob('*.csv')
+          for csv_file in csv_files:
+              try:
+                  with open(csv_file, 'r', encoding='utf-8', errors='ignore') as f:
+                      lines = f.readlines()
+                      
+                      # Skip first line (date header), start from column headers
+                      if len(lines) < 2:
+                          continue
+                      
+                      # Find header line
+                      header_idx = 0
+                      for i, line in enumerate(lines):
+                          if '"objid"' in line or 'name_prefix' in line:
+                              header_idx = i
+                              break
+                      
+                      clean_lines = lines[header_idx:]
+                      reader = csv.DictReader(clean_lines)
+                      
+                      for row in reader:
+                          prefix = row.get('name_prefix', '').strip().upper()
+                          if prefix == 'FRB':
+                              name = f"FRB {row.get('name', '').strip()}"
+                              frbs.append({
+                                  "name": name,
+                                  "date": row.get('discoverydate', '').strip()[:10],
+                                  "ra": row.get('ra', '').strip(),
+                                  "dec": row.get('declination', '').strip(),
+                                  "source": row.get('reporting_group', 'TNS').strip() or 'TNS'
+                              })
+              except Exception as e:
+                  print(f"Error processing {csv_file}: {e}")
+          
+          # Merge with existing, dedupe by name
+          seen = set()
+          merged = []
+          for frb in frbs + existing:
+              if frb['name'] not in seen:
+                  seen.add(frb['name'])
+                  merged.append(frb)
+          
+          # Sort by date descending
+          merged.sort(key=lambda x: x.get('date', ''), reverse=True)
+          
+          with open('frbs.json', 'w') as f:
+              json.dump(merged[:100], f, indent=2)
+          
+          print(f"Saved {len(merged[:100])} FRBs")
           EOF
       
       - name: Commit changes
