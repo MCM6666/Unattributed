@@ -2,7 +2,7 @@ name: Fetch FRBs
 
 on:
   schedule:
-    - cron: '0 12 * * *'  # Daily at noon UTC
+    - cron: '0 12 * * *'
   workflow_dispatch:
 
 jobs:
@@ -13,46 +13,60 @@ jobs:
       
       - name: Fetch FRBs from TNS
         run: |
-          curl -s "https://www.wis-tns.org/system/files/tns_public_objects/tns_public_objects.csv.zip" \
-            -H "User-Agent: Mozilla/5.0" \
-            -o tns.zip || exit 0
+          # Download TNS catalog with browser-like headers
+          curl -L "https://www.wis-tns.org/system/files/tns_public_objects/tns_public_objects.csv.zip" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+            -H "Accept-Language: en-US,en;q=0.5" \
+            -o tns.zip
           
-          unzip -o tns.zip || exit 0
+          # Check if download succeeded
+          if [ ! -s tns.zip ]; then
+            echo "Download failed or empty"
+            exit 0
+          fi
           
-          # Extract FRBs only, convert to JSON
+          # Unzip
+          unzip -o tns.zip || { echo "Unzip failed"; exit 0; }
+          
+          # Extract FRBs
           python3 << 'EOF'
           import csv
           import json
-          from datetime import datetime, timedelta
           
           frbs = []
-          cutoff = datetime.now() - timedelta(days=90)
           
-          for f in ["tns_public_objects.csv"]:
-              try:
-                  with open(f, 'r', encoding='utf-8', errors='ignore') as csvfile:
-                      # Skip first line (metadata)
-                      next(csvfile, None)
-                      reader = csv.DictReader(csvfile)
-                      for row in reader:
-                          if row.get('name_prefix', '').upper() == 'FRB':
-                              frbs.append({
-                                  'name': f"FRB {row.get('name', '')}",
-                                  'date': row.get('discoverydate', ''),
-                                  'ra': row.get('ra', ''),
-                                  'dec': row.get('decl', ''),
-                                  'source': row.get('reporting_groupname', row.get('source_group', 'TNS'))
-                              })
-              except Exception as e:
-                  print(f"Error: {e}")
-          
-          # Sort by date descending
-          frbs.sort(key=lambda x: x['date'], reverse=True)
-          
-          with open('frbs.json', 'w') as f:
-              json.dump(frbs[:100], f, indent=2)  # Keep latest 100
-          
-          print(f"Saved {len(frbs[:100])} FRBs")
+          try:
+              with open('tns_public_objects.csv', 'r', encoding='utf-8', errors='ignore') as f:
+                  # Skip the first line (metadata row)
+                  first_line = f.readline()
+                  
+                  reader = csv.DictReader(f)
+                  for row in reader:
+                      # Check if it's an FRB
+                      prefix = row.get('name_prefix', '').strip().upper()
+                      if prefix == 'FRB':
+                          frbs.append({
+                              "name": f"FRB {row.get('name', '').strip()}",
+                              "date": row.get('discoverydate', '').strip(),
+                              "ra": row.get('ra', '').strip(),
+                              "dec": row.get('decl', '').strip(),
+                              "source": row.get('reporting_group/0/groupname', row.get('source_group/groupname', 'TNS')).strip() or 'TNS'
+                          })
+              
+              if frbs:
+                  # Sort by date descending
+                  frbs.sort(key=lambda x: x.get('date', ''), reverse=True)
+                  
+                  with open('frbs.json', 'w') as f:
+                      json.dump(frbs, f, indent=2)
+                  
+                  print(f"Saved {len(frbs)} FRBs")
+              else:
+                  print("No FRBs found in catalog")
+                  
+          except Exception as e:
+              print(f"Error: {e}")
           EOF
       
       - name: Commit changes
@@ -60,5 +74,5 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add frbs.json || true
-          git diff --staged --quiet || git commit -m "Update FRB data"
+          git diff --staged --quiet || git commit -m "Update FRB data $(date +%Y-%m-%d)"
           git push || true
