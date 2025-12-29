@@ -1,0 +1,90 @@
+name: Fetch FRBs
+
+on:
+  schedule:
+    # Run daily at 12:00 UTC (before the 14:00 UTC post)
+    - cron: '0 12 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch FRBSTATS catalogue
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/HeRTA/FRBSTATS/main/catalogue.csv" -o catalogue.csv
+
+      - name: Convert CSV to JSON
+        run: |
+          cat << 'EOF' > convert.js
+          const fs = require('fs');
+          const csv = fs.readFileSync('catalogue.csv', 'utf8');
+          const lines = csv.trim().split('\n');
+          const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+          
+          const frbs = [];
+          const seen = new Set();
+          
+          for (let i = 1; i < lines.length; i++) {
+            // Handle CSV properly (fields may contain commas in quotes)
+            const values = [];
+            let current = '';
+            let inQuotes = false;
+            
+            for (const char of lines[i]) {
+              if (char === '"') {
+                inQuotes = !inQuotes;
+              } else if (char === ',' && !inQuotes) {
+                values.push(current.trim());
+                current = '';
+              } else {
+                current += char;
+              }
+            }
+            values.push(current.trim());
+            
+            const obj = {};
+            headers.forEach((h, idx) => {
+              obj[h] = values[idx] || '';
+            });
+            
+            // Skip duplicates by FRB name
+            const id = (obj.frb || obj.name || '').trim();
+            if (id && !seen.has(id)) {
+              seen.add(id);
+              frbs.push({
+                frb: obj.frb || '',
+                utc: obj.utc || '',
+                telescope: obj.telescope || '',
+                ra: obj.ra || '',
+                dec: obj.dec || '',
+                dm: obj.dm || '',
+                width: obj.width || '',
+                snr: obj.snr || '',
+                fluence: obj.fluence || '',
+                frequency: obj.frequency || ''
+              });
+            }
+          }
+          
+          // Sort by UTC descending (newest first)
+          frbs.sort((a, b) => {
+            const dateA = new Date(a.utc || '1970-01-01');
+            const dateB = new Date(b.utc || '1970-01-01');
+            return dateB - dateA;
+          });
+          
+          fs.writeFileSync('frbs.json', JSON.stringify(frbs, null, 2));
+          console.log(`Processed ${frbs.length} unique FRBs`);
+          EOF
+          node convert.js
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add frbs.json
+          git diff --staged --quiet || git commit -m "Update FRB catalogue $(date -u +%Y-%m-%d)"
+          git push
