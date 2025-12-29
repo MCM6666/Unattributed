@@ -16,7 +16,7 @@ jobs:
         run: |
           curl -fsSL "https://raw.githubusercontent.com/HeRTA/FRBSTATS/main/catalogue.csv" -o catalogue.csv
 
-            - name: Debug downloaded CSV
+      - name: Debug downloaded CSV
         run: |
           ls -lh catalogue.csv
           python - <<'PY'
