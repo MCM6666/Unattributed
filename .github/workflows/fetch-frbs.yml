@@ -1,90 +1,145 @@
-name: Fetch FRBs
+name: Update FRB catalogue (frbs.json)
 
 on:
+  workflow_dispatch:
   schedule:
-    # Run daily at 12:00 UTC (before the 14:00 UTC post)
-    - cron: '0 12 * * *'
-  workflow_dispatch: # Allow manual trigger
+    - cron: "17 14 * * *" # daily 14:17 UTC (pick any minute)
+
+permissions:
+  contents: write
 
 jobs:
-  fetch:
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Fetch FRBSTATS catalogue
+      - name: Download FRBSTATS catalogue.json (source of truth)
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/HeRTA/FRBSTATS/main/catalogue.csv" -o catalogue.csv
+          set -euo pipefail
+          SRC="https://raw.githubusercontent.com/HeRTA/FRBSTATS/main/catalogue.json"
+          echo "Downloading: $SRC"
+          curl -fsSL "$SRC" -o catalogue.json
+          echo "Downloaded bytes:"
+          wc -c catalogue.json
+          echo "First 1KB preview:"
+          head -c 1024 catalogue.json || true
+          echo ""
 
-      - name: Convert CSV to JSON
+      - name: Build frbs.json from catalogue.json (normalized)
         run: |
-          cat << 'EOF' > convert.js
-          const fs = require('fs');
-          const csv = fs.readFileSync('catalogue.csv', 'utf8');
-          const lines = csv.trim().split('\n');
-          const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
-          
-          const frbs = [];
-          const seen = new Set();
-          
-          for (let i = 1; i < lines.length; i++) {
-            // Handle CSV properly (fields may contain commas in quotes)
-            const values = [];
-            let current = '';
-            let inQuotes = false;
-            
-            for (const char of lines[i]) {
-              if (char === '"') {
-                inQuotes = !inQuotes;
-              } else if (char === ',' && !inQuotes) {
-                values.push(current.trim());
-                current = '';
-              } else {
-                current += char;
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("fs");
+
+          const raw = fs.readFileSync("catalogue.json", "utf8").trim();
+          if (!raw || raw.length < 10) {
+            console.error("catalogue.json looks empty/invalid");
+            process.exit(1);
+          }
+
+          let data;
+          try {
+            data = JSON.parse(raw);
+          } catch (e) {
+            console.error("Failed to JSON.parse(catalogue.json):", e.message);
+            process.exit(1);
+          }
+
+          // FRBSTATS catalogue.json is typically an array of rows/objects
+          // We'll normalize to the shape your edge function expects.
+          if (!Array.isArray(data)) {
+            // Some APIs wrap in {data:[...]} - handle that too.
+            if (data && Array.isArray(data.data)) data = data.data;
+          }
+
+          if (!Array.isArray(data) || data.length === 0) {
+            console.error("Parsed JSON but got no rows. Refusing to write [].");
+            process.exit(1);
+          }
+
+          const pick = (obj, keys) => {
+            for (const k of keys) {
+              if (obj && obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") {
+                return obj[k];
               }
             }
-            values.push(current.trim());
-            
-            const obj = {};
-            headers.forEach((h, idx) => {
-              obj[h] = values[idx] || '';
-            });
-            
-            // Skip duplicates by FRB name
-            const id = (obj.frb || obj.name || '').trim();
-            if (id && !seen.has(id)) {
-              seen.add(id);
-              frbs.push({
-                frb: obj.frb || '',
-                utc: obj.utc || '',
-                telescope: obj.telescope || '',
-                ra: obj.ra || '',
-                dec: obj.dec || '',
-                dm: obj.dm || '',
-                width: obj.width || '',
-                snr: obj.snr || '',
-                fluence: obj.fluence || '',
-                frequency: obj.frequency || ''
-              });
-            }
-          }
-          
-          // Sort by UTC descending (newest first)
-          frbs.sort((a, b) => {
-            const dateA = new Date(a.utc || '1970-01-01');
-            const dateB = new Date(b.utc || '1970-01-01');
-            return dateB - dateA;
-          });
-          
-          fs.writeFileSync('frbs.json', JSON.stringify(frbs, null, 2));
-          console.log(`Processed ${frbs.length} unique FRBs`);
-          EOF
-          node convert.js
+            return null;
+          };
 
-      - name: Commit if changed
+          const normalizeDate = (v) => {
+            if (!v) return null;
+            const s = String(v).trim();
+            // prefer YYYY-MM-DD if present
+            const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+            return m ? m[1] : s;
+          };
+
+          const out = [];
+          const seen = new Set();
+
+          for (const row of data) {
+            const name =
+              pick(row, ["frb", "FRB", "name", "Name", "designation", "Designation"]) ||
+              null;
+
+            if (!name) continue;
+
+            const id = String(name).trim();
+            if (seen.has(id)) continue;
+            seen.add(id);
+
+            const utc =
+              normalizeDate(pick(row, ["utc", "UTC", "date", "Date", "discovery_date", "Discovery_date"])) ||
+              null;
+
+            const telescope =
+              pick(row, ["telescope", "Telescope", "instrument", "Instrument", "telescope_name"]) ||
+              null;
+
+            const dm = pick(row, ["dm", "DM", "dm_obs", "DM_obs", "dispersion_measure"]) || null;
+            const width = pick(row, ["width", "Width", "w", "W", "burst_width"]) || null;
+            const snr = pick(row, ["snr", "SNR", "s_n", "S_N", "signal_to_noise"]) || null;
+
+            out.push({
+              frb: id,
+              utc,
+              telescope,
+              dm,
+              width,
+              snr,
+            });
+          }
+
+          if (out.length < 50) {
+            console.error(`Suspiciously low output count (${out.length}). Refusing to commit.`);
+            process.exit(1);
+          }
+
+          // Sort newest-first by utc if present, else keep stable.
+          out.sort((a, b) => {
+            const da = a.utc ? a.utc : "";
+            const db = b.utc ? b.utc : "";
+            return db.localeCompare(da);
+          });
+
+          fs.writeFileSync("frbs.json", JSON.stringify(out, null, 2));
+          console.log(`Wrote frbs.json with ${out.length} records`);
+          NODE
+
+      - name: Commit and push frbs.json
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add frbs.json
-          git diff --staged --quiet || git commit -m "Update FRB catalogue $(date -u +%Y-%m-%d)"
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update FRB catalogue $(date -u +%F)"
           git push
