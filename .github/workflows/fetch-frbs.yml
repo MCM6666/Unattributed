@@ -1,145 +1,109 @@
-name: Update FRB catalogue (frbs.json)
+name: Fetch FRBs
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "17 14 * * *" # daily 14:17 UTC (pick any minute)
-
-permissions:
-  contents: write
+    # Run daily at 12:00 UTC (before the 14:00 UTC post)
+    - cron: '0 12 * * *'
+  workflow_dispatch: # Allow manual trigger
 
 jobs:
-  build:
+  fetch:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Download FRBSTATS catalogue.json (source of truth)
+      - name: Fetch FRBSTATS catalogue
         run: |
-          set -euo pipefail
-          SRC="https://raw.githubusercontent.com/HeRTA/FRBSTATS/main/catalogue.json"
-          echo "Downloading: $SRC"
-          curl -fsSL "$SRC" -o catalogue.json
-          echo "Downloaded bytes:"
-          wc -c catalogue.json
-          echo "First 1KB preview:"
-          head -c 1024 catalogue.json || true
-          echo ""
+          curl -fsSL "https://raw.githubusercontent.com/HeRTA/FRBSTATS/main/catalogue.csv" -o catalogue.csv
 
-      - name: Build frbs.json from catalogue.json (normalized)
+            - name: Debug downloaded CSV
         run: |
-          set -euo pipefail
-          node <<'NODE'
-          const fs = require("fs");
+          ls -lh catalogue.csv
+          python - <<'PY'
+          import pathlib
+          p = pathlib.Path("catalogue.csv")
+          print("bytes:", p.stat().st_size)
+          print("first 3 lines:")
+          with p.open("r", encoding="utf-8", errors="replace") as f:
+            for _ in range(3):
+              print(f.readline().rstrip("\n"))
+          PY
 
-          const raw = fs.readFileSync("catalogue.json", "utf8").trim();
-          if (!raw || raw.length < 10) {
-            console.error("catalogue.json looks empty/invalid");
-            process.exit(1);
-          }
-
-          let data;
-          try {
-            data = JSON.parse(raw);
-          } catch (e) {
-            console.error("Failed to JSON.parse(catalogue.json):", e.message);
-            process.exit(1);
-          }
-
-          // FRBSTATS catalogue.json is typically an array of rows/objects
-          // We'll normalize to the shape your edge function expects.
-          if (!Array.isArray(data)) {
-            // Some APIs wrap in {data:[...]} - handle that too.
-            if (data && Array.isArray(data.data)) data = data.data;
-          }
-
-          if (!Array.isArray(data) || data.length === 0) {
-            console.error("Parsed JSON but got no rows. Refusing to write [].");
-            process.exit(1);
-          }
-
-          const pick = (obj, keys) => {
-            for (const k of keys) {
-              if (obj && obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") {
-                return obj[k];
-              }
-            }
-            return null;
-          };
-
-          const normalizeDate = (v) => {
-            if (!v) return null;
-            const s = String(v).trim();
-            // prefer YYYY-MM-DD if present
-            const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
-            return m ? m[1] : s;
-          };
-
-          const out = [];
-          const seen = new Set();
-
-          for (const row of data) {
-            const name =
-              pick(row, ["frb", "FRB", "name", "Name", "designation", "Designation"]) ||
-              null;
-
-            if (!name) continue;
-
-            const id = String(name).trim();
-            if (seen.has(id)) continue;
-            seen.add(id);
-
-            const utc =
-              normalizeDate(pick(row, ["utc", "UTC", "date", "Date", "discovery_date", "Discovery_date"])) ||
-              null;
-
-            const telescope =
-              pick(row, ["telescope", "Telescope", "instrument", "Instrument", "telescope_name"]) ||
-              null;
-
-            const dm = pick(row, ["dm", "DM", "dm_obs", "DM_obs", "dispersion_measure"]) || null;
-            const width = pick(row, ["width", "Width", "w", "W", "burst_width"]) || null;
-            const snr = pick(row, ["snr", "SNR", "s_n", "S_N", "signal_to_noise"]) || null;
-
-            out.push({
-              frb: id,
-              utc,
-              telescope,
-              dm,
-              width,
-              snr,
-            });
-          }
-
-          if (out.length < 50) {
-            console.error(`Suspiciously low output count (${out.length}). Refusing to commit.`);
-            process.exit(1);
-          }
-
-          // Sort newest-first by utc if present, else keep stable.
-          out.sort((a, b) => {
-            const da = a.utc ? a.utc : "";
-            const db = b.utc ? b.utc : "";
-            return db.localeCompare(da);
-          });
-
-          fs.writeFileSync("frbs.json", JSON.stringify(out, null, 2));
-          console.log(`Wrote frbs.json with ${out.length} records`);
-          NODE
-
-      - name: Commit and push frbs.json
+      - name: Convert CSV to JSON (robust)
         run: |
-          set -euo pipefail
+          python - <<'PY'
+          import csv, json
+          from datetime import datetime
+
+          # Try to sniff delimiter (comma/semicolon/etc)
+          with open("catalogue.csv", "r", encoding="utf-8", errors="replace") as f:
+            sample = f.read(4096)
+            f.seek(0)
+            try:
+              dialect = csv.Sniffer().sniff(sample, delimiters=[",",";","\t","|"])
+            except Exception:
+              dialect = csv.excel
+
+            reader = csv.DictReader(f, dialect=dialect)
+
+            frbs = []
+            seen = set()
+
+            def norm(s):
+              return (s or "").strip()
+
+            for row in reader:
+              # handle varied header casing
+              keys = {k.lower().strip(): k for k in row.keys() if k}
+              def get(field):
+                k = keys.get(field)
+                return norm(row.get(k)) if k else ""
+
+              frb = get("frb") or get("name")
+              if not frb or frb in seen:
+                continue
+
+              seen.add(frb)
+              frbs.append({
+                "frb": frb,
+                "utc": get("utc"),
+                "telescope": get("telescope"),
+                "ra": get("ra"),
+                "dec": get("dec"),
+                "dm": get("dm"),
+                "width": get("width"),
+                "snr": get("snr"),
+                "fluence": get("fluence"),
+                "frequency": get("frequency"),
+              })
+
+          # Sort newest-first by utc if present
+          def parse_dt(s):
+            s = (s or "").strip()
+            if not s:
+              return datetime(1970,1,1)
+            # allow date-only
+            if len(s) == 10 and s[4] == "-" and s[7] == "-":
+              s = s + "T00:00:00"
+            # best-effort parse
+            try:
+              return datetime.fromisoformat(s.replace("Z",""))
+            except Exception:
+              return datetime(1970,1,1)
+
+          frbs.sort(key=lambda r: parse_dt(r.get("utc")), reverse=True)
+
+          with open("frbs.json", "w", encoding="utf-8") as out:
+            json.dump(frbs, out, indent=2)
+
+          print("Processed unique FRBs:", len(frbs))
+          PY
+
+
+      - name: Commit if changed
+        run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git add frbs.json
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-
-          git commit -m "Update FRB catalogue $(date -u +%F)"
+          git diff --staged --quiet || git commit -m "Update FRB catalogue $(date -u +%Y-%m-%d)"
           git push
